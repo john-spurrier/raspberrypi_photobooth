@@ -4,6 +4,17 @@ import datetime
 import subprocess
 import pygame
 
+# picamera2 lets us pull frames directly into a numpy array (and therefore a
+# pygame surface) so we can draw the live camera feed as the background of
+# the countdown screen. It only exists on a Raspberry Pi, so we import it
+# lazily and fall back to the legacy rpicam-still subprocess path on dev
+# machines or if the user hasn't installed it (`sudo apt install python3-picamera2`).
+try:
+    from picamera2 import Picamera2
+    HAVE_PICAMERA2 = True
+except Exception:                       # pragma: no cover - environment dependent
+    HAVE_PICAMERA2 = False
+
 __author__ = "digiiash"
 __license__ = "MIT"
 __version__ = "2.0.0"
@@ -23,13 +34,14 @@ CAPTURE_HEIGHT  = 768
 # exists. The capture/preview helpers below use the libcamera-still flag set.
 CAPTURE_CMD = "rpicam-still"
 
-# Under X11/Wayland on Bookworm, the libcamera preview is a regular OS window
-# that will either cover or be covered by the pygame fullscreen window, which
-# breaks the countdown overlay. We default the live preview off here and just
-# show the countdown on a black screen, then flash + capture. Flip to True if
-# you switch the capture pipeline to picamera2 (which can draw frames straight
-# into a pygame surface).
-SHOW_PREVIEW = False
+# When picamera2 is available we render the camera feed straight into the
+# pygame fullscreen surface during the countdown so the subject can see
+# themselves pose. If picamera2 isn't installed we silently fall back to a
+# plain black countdown background and capture via rpicam-still.
+SHOW_PREVIEW    = True
+MIRROR_PREVIEW  = True     # flip horizontally so it behaves like a selfie cam
+PREVIEW_FPS     = 30       # cap preview redraws so we don't peg the CPU
+CAMERA_WARMUP   = 0.6      # let AWB/AGC settle after starting the camera
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR  = os.path.join(SCRIPT_DIR, "images")
@@ -136,33 +148,85 @@ def wait_for_click(rects):
 
 
 # ── Camera helpers ─────────────────────────────────────────────────────────────
-def start_preview(screen_w, screen_h):
-    """Launch libcamera-still as a full-screen preview."""
-    if not SHOW_PREVIEW:
+def init_camera():
+    """
+    Start picamera2 in a video configuration sized for capture. Returns the
+    running Picamera2 instance, or None if picamera2 isn't installed / fails
+    to start (in which case the rest of the script falls back to the
+    rpicam-still subprocess path with no live preview).
+    """
+    if not (SHOW_PREVIEW and HAVE_PICAMERA2):
         return None
-    preview_rect = f"0,0,{screen_w},{screen_h}"
-    return subprocess.Popen([
-        CAPTURE_CMD,
-        "-p", preview_rect,
-        "-t", "0",
-    ])
+    try:
+        picam2 = Picamera2()
+        # NOTE on the "BGR888" string: picamera2 uses the V4L2 naming
+        # convention where the format name describes channel order from MSB
+        # to LSB of each pixel, which is the opposite of how the bytes sit
+        # in memory. "BGR888" actually lays bytes out as R, G, B per pixel
+        # -- exactly what pygame.image.frombuffer(..., "RGB") expects.
+        config = picam2.create_video_configuration(
+            main={"size": (CAPTURE_WIDTH, CAPTURE_HEIGHT), "format": "BGR888"},
+        )
+        picam2.configure(config)
+        picam2.start()
+        time.sleep(CAMERA_WARMUP)
+        return picam2
+    except Exception as exc:
+        print(f"[WARNING] Could not start picamera2 preview: {exc}")
+        return None
 
 
-def stop_preview(proc):
-    """Terminate the preview subprocess cleanly (kill if it hangs)."""
-    if proc and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+def stop_camera(picam2):
+    """Shut down the picamera2 instance cleanly."""
+    if picam2 is None:
+        return
+    try:
+        picam2.stop()
+        picam2.close()
+    except Exception as exc:
+        print(f"[WARNING] Error stopping picamera2: {exc}")
 
 
-def capture_photo(path):
+def grab_preview_surface(picam2, screen_size):
+    """
+    Capture one frame from picamera2 and return it as a pygame surface that
+    has been cover-scaled (and optionally mirrored) to fill the screen.
+    Returns None if no frame is available.
+    """
+    if picam2 is None:
+        return None
+    try:
+        arr = picam2.capture_array("main")            # shape (H, W, 3), RGB bytes
+    except Exception as exc:
+        print(f"[WARNING] Preview frame error: {exc}")
+        return None
+
+    h, w = arr.shape[:2]
+    frame = pygame.image.frombuffer(arr.tobytes(), (w, h), "RGB")
+    if MIRROR_PREVIEW:
+        frame = pygame.transform.flip(frame, True, False)
+
+    sw, sh = screen_size
+    scale = max(sw / w, sh / h)                       # cover-scale, no letterbox
+    new_w, new_h = int(w * scale), int(h * scale)
+    if (new_w, new_h) != (w, h):
+        frame = pygame.transform.scale(frame, (new_w, new_h))
+    return frame, ((sw - new_w) // 2, (sh - new_h) // 2)
+
+
+def capture_photo(picam2, path):
     """
     Snap a single JPEG to `path`. The screen should already be white when
     this is called so the subject is lit during the exposure.
+    Uses picamera2 when available, otherwise shells out to rpicam-still.
     """
+    if picam2 is not None:
+        try:
+            picam2.capture_file(path)
+            return
+        except Exception as exc:
+            print(f"[WARNING] picamera2 capture failed, falling back: {exc}")
+
     subprocess.call([
         CAPTURE_CMD,
         "-t", str(CAPTURE_TIMEOUT),
@@ -174,17 +238,22 @@ def capture_photo(path):
 
 
 # ── Countdown + flash ──────────────────────────────────────────────────────────
-def draw_countdown_number(screen, number, screen_size, font_large):
+def draw_countdown_frame(screen, number, screen_size, font_large, picam2):
     """
-    Paint the screen black (camera preview shows through) then draw:
+    Draw one frame of the countdown:
+      - live camera preview as the background (or black if no camera)
       - a semi-transparent dark backing circle
-      - a drop shadow
-      - the countdown number
+      - a drop shadow + the countdown number on top
     """
     w, h = screen_size
     cx, cy = w // 2, h // 2
 
-    screen.fill((0, 0, 0))
+    bg = grab_preview_surface(picam2, screen_size)
+    if bg is None:
+        screen.fill((0, 0, 0))
+    else:
+        frame, pos = bg
+        screen.blit(frame, pos)
 
     circle_surf = pygame.Surface(
         (CIRCLE_RADIUS * 2, CIRCLE_RADIUS * 2), pygame.SRCALPHA
@@ -211,28 +280,37 @@ def draw_countdown_number(screen, number, screen_size, font_large):
     pygame.display.flip()
 
 
+def run_countdown(screen, screen_size, font_large, picam2, clock):
+    """
+    Count down from COUNTDOWN_SECS to 1, holding each digit on screen for
+    COUNTDOWN_HOLD seconds while continuously refreshing the live preview
+    behind it (so the image doesn't freeze between numbers).
+    """
+    for n in range(COUNTDOWN_SECS, 0, -1):
+        end_time = time.monotonic() + COUNTDOWN_HOLD
+        while time.monotonic() < end_time:
+            draw_countdown_frame(screen, n, screen_size, font_large, picam2)
+            pygame.event.pump()
+            clock.tick(PREVIEW_FPS)
+
+
 def flash_white(screen):
     """Fill the entire screen white — used as fill light during capture."""
     screen.fill((255, 255, 255))
     pygame.display.flip()
 
 
-def shoot_photo(screen, screen_size, font_large, out_path, shot_num, total):
-    """One full shoot cycle: preview + countdown + flash + capture."""
-    preview = start_preview(*screen_size)
-    time.sleep(PREVIEW_SETTLE)
-
-    for n in range(COUNTDOWN_SECS, 0, -1):
-        draw_countdown_number(screen, n, screen_size, font_large)
-        time.sleep(COUNTDOWN_HOLD)
+def shoot_photo(screen, screen_size, font_large, out_path, shot_num, total,
+                picam2, clock):
+    """One full shoot cycle: live-preview countdown + flash + capture."""
+    run_countdown(screen, screen_size, font_large, picam2, clock)
 
     flash_white(screen)
     time.sleep(FLASH_SETTLE)
-    stop_preview(preview)
-    capture_photo(out_path)
+    capture_photo(picam2, out_path)
 
     # Keep flashing white briefly so the transition looks intentional, then
-    # clear to black so the next preview launch isn't masked by white.
+    # clear to black so the next countdown starts from a clean frame.
     flash_white(screen)
     time.sleep(0.1)
     screen.fill((0, 0, 0))
@@ -348,14 +426,14 @@ def show_attract(screen, screen_size, attract, font_btn):
     return start_rect
 
 
-def run_session(screen, screen_size, font_large):
+def run_session(screen, screen_size, font_large, picam2, clock):
     """Run one full NUM_PHOTOS shoot, returning the list of file paths."""
     os.makedirs(TMP_DIR, exist_ok=True)
     paths = []
     for i in range(NUM_PHOTOS):
         path = os.path.join(TMP_DIR, f"photo_{i + 1}.jpg")
         shoot_photo(screen, screen_size, font_large,
-                    path, i + 1, NUM_PHOTOS)
+                    path, i + 1, NUM_PHOTOS, picam2, clock)
         paths.append(path)
     return paths
 
@@ -380,6 +458,14 @@ def main():
     font_large  = pygame.font.SysFont(None, FONT_SIZE,    bold=True)
     font_btn    = pygame.font.SysFont(None, BTN_FONT_SIZE, bold=True)
     font_footer = pygame.font.SysFont(None, 48,           bold=True)
+    clock       = pygame.time.Clock()
+
+    picam2 = init_camera()
+    if picam2 is None:
+        print("[INFO] Live preview disabled "
+              "(picamera2 not available or failed to start).")
+    else:
+        print("[INFO] Live camera preview active.")
 
     print("Photobooth ready — tap START on the screen.")
 
@@ -391,7 +477,8 @@ def main():
 
             # Inner loop so REDO retakes without going back to the attract screen
             while True:
-                paths = run_session(screen, screen_size, font_large)
+                paths = run_session(screen, screen_size, font_large,
+                                    picam2, clock)
                 strip = compose_strip(paths, font_footer)
                 action = show_review(screen, screen_size, strip, font_btn)
 
@@ -406,6 +493,7 @@ def main():
     except (SystemExit, KeyboardInterrupt):
         print("Exiting.")
     finally:
+        stop_camera(picam2)
         pygame.quit()
 
 
