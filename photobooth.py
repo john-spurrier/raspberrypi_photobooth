@@ -85,6 +85,13 @@ BTN_FG        = (255, 255, 255)
 BTN_BG_START  = (220, 50, 90)
 BTN_BG_SAVE   = (40, 170, 90)
 BTN_BG_REDO   = (60, 110, 200)
+
+# ── Close (×) button ──────────────────────────────────────────────────────────
+CLOSE_BG       = (200, 30, 30)   # red circle
+CLOSE_FG       = (255, 255, 255) # white X strokes
+CLOSE_SIZE     = 90              # button diameter in px (touch-friendly)
+CLOSE_MARGIN   = 24              # gap from the top/right edge
+CLOSE_STROKE   = 8               # thickness of the X strokes
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -114,6 +121,37 @@ def draw_button(screen, text, font, center, bg):
     rect.center = center
     pygame.draw.rect(screen, bg, rect, border_radius=BTN_RADIUS)
     screen.blit(label, label.get_rect(center=rect.center))
+    return rect
+
+
+def draw_close_button(screen, screen_size):
+    """
+    Draw a red circular close (×) button in the top-right corner and return
+    its bounding rect. Lines are drawn rather than rendered as text so the
+    glyph stays crisp regardless of font availability.
+    """
+    sw, _ = screen_size
+    rect = pygame.Rect(0, 0, CLOSE_SIZE, CLOSE_SIZE)
+    rect.topright = (sw - CLOSE_MARGIN, CLOSE_MARGIN)
+    cx, cy = rect.center
+    radius = CLOSE_SIZE // 2
+
+    pygame.draw.circle(screen, CLOSE_BG, (cx, cy), radius)
+
+    # X strokes, inset from the circle edge so they don't touch the rim.
+    inset = CLOSE_SIZE // 4
+    pygame.draw.line(
+        screen, CLOSE_FG,
+        (rect.left + inset,  rect.top + inset),
+        (rect.right - inset, rect.bottom - inset),
+        CLOSE_STROKE,
+    )
+    pygame.draw.line(
+        screen, CLOSE_FG,
+        (rect.right - inset, rect.top + inset),
+        (rect.left + inset,  rect.bottom - inset),
+        CLOSE_STROKE,
+    )
     return rect
 
 
@@ -392,14 +430,15 @@ def show_review(screen, screen_size, strip_surf, font_btn):
                             (sw // 2 - 200, btn_y), BTN_BG_REDO)
     save_rect = draw_button(screen, "SAVE", font_btn,
                             (sw // 2 + 200, btn_y), BTN_BG_SAVE)
+    close_rect = draw_close_button(screen, screen_size)
     pygame.display.flip()
 
-    idx = wait_for_click([save_rect, redo_rect])
+    idx = wait_for_click([save_rect, redo_rect, close_rect])
     if idx == 0:
         return "save"
     if idx == 1:
         return "redo"
-    return "quit"
+    return "quit"   # idx == 2 (× pressed) or -1 (ESC / window close)
 
 
 def save_strip(strip_surf):
@@ -414,7 +453,10 @@ def save_strip(strip_surf):
 
 # ── Attract screen + session runner ────────────────────────────────────────────
 def show_attract(screen, screen_size, attract, font_btn):
-    """Draw the attract image plus a START button; return the button rect."""
+    """
+    Draw the attract image plus a START button and a corner × close button.
+    Returns (start_rect, close_rect).
+    """
     sw, sh = screen_size
     screen.blit(attract, (0, 0))
     start_rect = draw_button(
@@ -422,8 +464,9 @@ def show_attract(screen, screen_size, attract, font_btn):
         (sw // 2, int(sh * 0.78)),
         BTN_BG_START,
     )
+    close_rect = draw_close_button(screen, screen_size)
     pygame.display.flip()
-    return start_rect
+    return start_rect, close_rect
 
 
 def run_session(screen, screen_size, font_large, picam2, clock):
@@ -471,8 +514,11 @@ def main():
 
     try:
         while True:
-            start_rect = show_attract(screen, screen_size, attract, font_btn)
-            if wait_for_click(start_rect) == -1:
+            start_rect, close_rect = show_attract(
+                screen, screen_size, attract, font_btn
+            )
+            idx = wait_for_click([start_rect, close_rect])
+            if idx == -1 or idx == 1:   # ESC, window-close, or × tapped
                 break
 
             # Inner loop so REDO retakes without going back to the attract screen
