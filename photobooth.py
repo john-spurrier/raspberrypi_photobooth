@@ -21,7 +21,7 @@ CAPTURE_HEIGHT  = 768
 
 # Raspberry Pi OS Bookworm and newer ship libcamera; raspistill no longer
 # exists. The capture/preview helpers below use the libcamera-still flag set.
-CAPTURE_CMD = "libcamera-still"
+CAPTURE_CMD = "rpicam-still"
 
 # Under X11/Wayland on Bookworm, the libcamera preview is a regular OS window
 # that will either cover or be covered by the pygame fullscreen window, which
