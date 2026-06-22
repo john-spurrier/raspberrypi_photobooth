@@ -1,35 +1,3 @@
-#!/usr/bin/env python3
-"""
-Photobooth
-==========
-Made by digiiash (touchscreen edition)
-
-A Raspberry Pi photobooth that runs entirely from the touchscreen — no external
-buttons or printer required.
-
-Flow:
-  1. Idle           - shows images/attract.jpg with an on-screen START button.
-  2. START tapped   - live camera preview with a 3-2-1 countdown overlay.
-  3. Flash + snap   - the screen flashes white (acts as fill light for the
-                      subject) while a photo is captured to tmp/.
-  4. Steps 2-3 are repeated NUM_PHOTOS times (default 3).
-  5. Review screen  - the 3 photos are composed into a classic vertical
-                      photo-strip and shown with SAVE / REDO buttons.
-  6. SAVE writes the strip to  photos/strip_<timestamp>.jpg  and returns to
-     the attract screen. REDO discards the shoot and starts over.
-
-Images (in the images/ folder next to this script):
-  attract.jpg   - idle / rest screen (optional; placeholder used if missing)
-
-Saved strips are written to the photos/ folder next to this script.
-
-Tweak the constants in the "Strip layout" and "Countdown overlay style"
-sections to customize the look.
-
-Author : digiiash
-License : MIT
-"""
-
 import os
 import time
 import datetime
@@ -51,10 +19,17 @@ PREVIEW_SETTLE  = 0.4      # seconds to wait after starting preview
 CAPTURE_WIDTH   = 1024     # captured photo resolution (kept modest for speed)
 CAPTURE_HEIGHT  = 768
 
-# Switch to "libcamera-still" on newer Raspberry Pi OS (Bookworm+).
-# Note: libcamera-still uses slightly different flags; see capture/preview
-# helpers below if you change this.
-CAPTURE_CMD = "raspistill"
+# Raspberry Pi OS Bookworm and newer ship libcamera; raspistill no longer
+# exists. The capture/preview helpers below use the libcamera-still flag set.
+CAPTURE_CMD = "libcamera-still"
+
+# Under X11/Wayland on Bookworm, the libcamera preview is a regular OS window
+# that will either cover or be covered by the pygame fullscreen window, which
+# breaks the countdown overlay. We default the live preview off here and just
+# show the countdown on a black screen, then flash + capture. Flip to True if
+# you switch the capture pipeline to picamera2 (which can draw frames straight
+# into a pygame surface).
+SHOW_PREVIEW = False
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR  = os.path.join(SCRIPT_DIR, "images")
@@ -162,13 +137,14 @@ def wait_for_click(rects):
 
 # ── Camera helpers ─────────────────────────────────────────────────────────────
 def start_preview(screen_w, screen_h):
-    """Launch raspistill as a full-screen preview behind the framebuffer."""
+    """Launch libcamera-still as a full-screen preview."""
+    if not SHOW_PREVIEW:
+        return None
     preview_rect = f"0,0,{screen_w},{screen_h}"
     return subprocess.Popen([
         CAPTURE_CMD,
-        "-ex", "auto",
         "-p", preview_rect,
-        "--timeout", "0",
+        "-t", "0",
     ])
 
 
@@ -189,10 +165,9 @@ def capture_photo(path):
     """
     subprocess.call([
         CAPTURE_CMD,
-        "-ex", "auto",
         "-t", str(CAPTURE_TIMEOUT),
-        "-w", str(CAPTURE_WIDTH),
-        "-h", str(CAPTURE_HEIGHT),
+        "--width", str(CAPTURE_WIDTH),
+        "--height", str(CAPTURE_HEIGHT),
         "-n",
         "-o", path,
     ])
@@ -387,15 +362,19 @@ def run_session(screen, screen_size, font_large):
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 def main():
-    os.environ["SDL_FBDEV"] = "/dev/fb0"
-    os.environ.setdefault("SDL_VIDEODRIVER", "fbcon")
-
-    pygame.init()
-    pygame.mouse.set_visible(False)
+    # Intentionally do NOT force SDL_VIDEODRIVER here. The old "fbcon" driver
+    # is SDL 1.x only and is missing from the SDL 2 build that pygame 2 uses,
+    # which makes pygame.init() silently fail and the next pygame call raise
+    # "video system not initialized". Launched from the Pi desktop, SDL will
+    # auto-pick X11 (or Wayland) and everything just works.
+    pygame.display.init()
+    pygame.font.init()
 
     info = pygame.display.Info()
     screen_size = (info.current_w, info.current_h)
     screen = pygame.display.set_mode(screen_size, pygame.FULLSCREEN)
+    pygame.mouse.set_visible(False)
+
 
     attract     = load_attract(screen_size)
     font_large  = pygame.font.SysFont(None, FONT_SIZE,    bold=True)
